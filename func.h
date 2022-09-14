@@ -14,6 +14,8 @@ struct Option {  // 配置选项
     int wordLength;  // 词长度
     int drop;  // 是否跳过过滤
     int pigeon;  // 是否启动鸽笼过滤
+	int grid_size; // how big each iteration should be. 
+	int buffer_size; // how big the buffer should be. 
 };
 struct Read {  // 读长
     std::string name;

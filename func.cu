@@ -35,6 +35,12 @@ void checkOption(int argc, char **argv, Option &option) {
         case 'p':
             option.pigeon = std::stoi(argv[i+1]);
             break;
+		case 'g': 
+			option.grid_size = std::stoi(argv[i + 1]); 
+			break; 
+		case 'b':
+			option.buffer_size = std::stoi(argv[i + 1]); 
+			break; 
         default:
             printUsage();
             break;
@@ -85,6 +91,8 @@ void checkOption(int argc, char **argv, Option &option) {
     std::cout << "相似阈值:\t" << option.threshold << std::endl;
     std::cout << "word长度:\t" << option.wordLength << std::endl;
     std::cout << "不跑过滤器\t" << option.drop << std::endl;
+	std::cout << "Grid size:\t" << option.grid_size << std::endl; 
+	std::cout << "Buffer size:\t" << option.buffer_size << std::endl;
 }
 // readFile 读文件
 void readFile(std::vector<Read> &reads, Option &option) {
@@ -459,7 +467,7 @@ void compressData(Data &data) {
 }
 //--------------------聚类过程--------------------//
 // initBench 初始化bench
-void initBench(Bench &bench, int readsCount) {
+__host__ void initBench(Bench &bench, int readsCount) {
     cudaMallocManaged(&bench.table, (1<<2*8)*sizeof(unsigned short));  // table
     memset(bench.table, 0, (1<<2*8)*sizeof(unsigned short));  // 清0
     cudaMallocManaged(&bench.cluster, readsCount*sizeof(int));  // 聚类结果
@@ -480,7 +488,7 @@ void initBench(Bench &bench, int readsCount) {
     cudaDeviceSynchronize();  // 同步数据
 }
 // updateRepresentative 更新代表序列
-void updateRepresentative(int *cluster, int &representative, int readsCount) {
+__device__ void updateRepresentative(int *cluster, int &representative, int readsCount) {
     representative += 1;
     while (representative < readsCount) {
         if (cluster[representative] == -1) {  // 遇到代表序列了
@@ -504,7 +512,7 @@ int *representative, int readsCount) {
     }
 }
 // undateRemain 更新未聚类列表
-void updateRemain(int *cluster, int *remainList, int &remainCount) {
+__device__ void updateRemain(int *cluster, int *remainList, int &remainCount) {
     int count = 0;
     for (int i=0; i<remainCount; i++) {
         int index = remainList[i];
@@ -517,7 +525,7 @@ void updateRemain(int *cluster, int *remainList, int &remainCount) {
 }
 // jobList -1被过滤掉了，其他表示需要计算的序列
 // undateJobs 更新任务列表
-void updatJobs(int *jobList, int &jobCount) {
+__device__ void updatJobs(int *jobList, int &jobCount) {
     int count = 0;
     for (int i=0; i<jobCount; i++) {
         int value = jobList[i];
@@ -601,7 +609,7 @@ unsigned short *table, int *jobList, int jobCount) {
 // kernel_dynamic 动态规划
 __global__ void kernel_dynamic(int *lengths, long *offsets, int *gaps,
 unsigned int *compressed, int *baseCutoff, int *cluster, int *jobList,
-int jobCount, int representative) {
+int jobCount, int representative, int readsCount, int buffer_size) {
     //----准备数据----//
     __shared__ unsigned int bases[2048];  // 65536/32
     int text = representative;
@@ -698,63 +706,152 @@ int jobCount, int representative) {
     }
     int cutoff = baseCutoff[query];
     if (sum > cutoff) {
-        cluster[query] = text;
+		// We want to place a number in this spot. The first value in cluster is the length, so we should increment it (we're adding 1 more item). 
+		int *spot = &(cluster[query * buffer_size]);
+		unsigned int length = atomicInc((unsigned int*)spot, buffer_size);
+		if (length == buffer_size) {
+			printf("Error: buffer reached max capacity. Increase buffer size (b) or decrease grid size (g).\n");
+			__trap(); 
+		}
+		spot[length + 1] = text;
     } else {
         jobList[index] = -1;
     }
 }
+
+__global__ void kernel_iteration(Data data, Bench& bench, int readsCount, int index, const int grid_size, const int buffer_size, int* cluster, unsigned short *tables, int *job_lists) {
+	index = index * grid_size + blockIdx.x;
+	if (index >= readsCount) return; 
+	
+	// Create kernel-specific items.
+	unsigned short *table = &(tables[blockIdx.x * (1 << 2 * 8)]);
+	
+	int *jobList = &(job_lists[blockIdx.x * readsCount]); 
+	int jobCount = readsCount - index;
+	for (int i = 0; i < jobCount; i++) 
+		jobList[i] = i + index;
+	
+	//----Filtering work----//
+	// Generate table ok
+	kernel_makeTable << < 128, 128 >>> (data.offsets, data.words,
+		data.wordCounts, data.orders, table, index);
+	
+	kernel_preFilter << < (jobCount + 127) / 128, 128 >>>
+		(data.prefix, data.baseCutoff, jobList,
+			jobCount, index);
+	cudaDeviceSynchronize(); // synchronize data
+	
+	updatJobs(jobList, jobCount); // update job ok
+	if (jobCount > 0) { // standard filter ok
+		kernel_filter << < jobCount, 128 >>>
+			(data.offsets, data.words, data.wordCounts, data.orders,
+				data.wordCutoff, table, jobList, jobCount);
+		cudaDeviceSynchronize(); // synchronize data
+	}
+	
+	//----Comparison work----//
+	updatJobs(jobList, jobCount); // update job ok
+	if (jobCount > 0) { // dynamic programming ok
+		kernel_dynamic << < (jobCount + 127) / 128, 128 >>> (data.lengths,
+			data.offsets, data.gaps, data.compressed, data.baseCutoff,
+			cluster, jobList, jobCount, index, readsCount, buffer_size);
+	}
+	
+	//----Finishing work----//
+	// clear table oka
+	kernel_cleanTable << < 128, 128 >>> (data.offsets, data.words,
+		data.wordCounts, data.orders, table, index);
+}
+
+// Returns the smallest valid value in the buffer at the index, or readsCount if it doesn't exist. 
+__device__ int get_smallest(const int buffer_size, const int readsCount, int* valid, int* cluster, int index) {
+	int *ptr = &(cluster[index * buffer_size]);
+	int length = ptr[0];
+	
+	// Choose the smallest valid item from the list. 
+	int smallest = readsCount;
+	for (int i = 1; i <= length; i++)
+		if (ptr[i] < smallest && valid[ptr[i]])
+			smallest = ptr[i];
+	
+	return smallest; 
+}
+
+// Cluster is offset by the start point. 
+__global__ void kernel_set_valid_parallel(const int limit, const int buffer_size, const int readsCount, int* valid, int* cluster) {
+	int index = blockIdx.x * blockDim.x + threadIdx.x; 
+	if (index >= limit) return; 
+	
+	int *ptr = &(cluster[index * buffer_size]); 
+	int smallest = get_smallest(buffer_size, readsCount, valid, cluster, index); 
+	if (smallest != readsCount) {
+		ptr[0] = 1; // length = 1 
+		ptr[1] = smallest; 
+	}
+	else ptr[0] = 0; // length = 0 
+}
+
+__global__ void kernel_set_valid_serial(const int readsCount, const int grid_size, const int buffer_size, const int max_thread_count, int* valid, int* cluster, int iteration) {
+	int start = iteration * grid_size; 
+	int end = min(readsCount, start + grid_size);
+
+	for (int read = start; read < end; read++) {
+		int smallest = get_smallest(buffer_size, readsCount, valid, cluster, read);
+				
+		int index; 
+		if (smallest == readsCount) {
+			index = read; 
+			valid[index] = 1; 
+		}
+		else index = smallest;
+
+		// Note: cluster is normally offset by the buffer size, 
+		// but we ignore the offset here to save time later on. 
+		cluster[read] = index;
+	}
+	
+	if (end != readsCount) {
+		int *offset_cluster = &(cluster[end * buffer_size]); 
+		int limit = readsCount - end; 
+		int threads = min(max_thread_count, limit); 
+		int blocks = (int)ceilf((float)limit / threads); 
+		kernel_set_valid_parallel<<<threads, blocks>>>(limit, buffer_size, readsCount, valid, offset_cluster); 
+	}
+}
+
 // 聚类
 void clustering(Option &option, Data &data, Bench &bench) {
-    int readsCount = data.readsCount;
-    initBench(bench, readsCount);  // 初始化bench ok
-    std::cout << "代表序列/总序列数:" << std::endl;
-    while (true) {  // 聚类
-        //----准备工作----//
-        // 更新代表序列 ok
-        updateRepresentative(bench.cluster, bench.representative, readsCount);
-        if (bench.representative >= readsCount) break;  // 判断聚类完成
-        // 打印进度
-        std::cout << "\r" << bench.representative+1 << "/" << readsCount;
-        std::flush(std::cout);  // 刷新缓存
-        // 更新未聚类列表 ok
-        updateRemain(bench.cluster, bench.remainList, bench.remainCount);
-        // 分配任务 ok
-        memcpy(bench.jobList, bench.remainList, bench.remainCount*sizeof(int));
-        bench.jobCount = bench.remainCount;
-        cudaDeviceSynchronize();  // 同步数据
-        //----过滤工作----//
-        // 生成table ok
-        kernel_makeTable<<<128, 128>>>(data.offsets, data.words,
-        data.wordCounts, data.orders, bench.table, bench.representative);
-        cudaDeviceSynchronize();  // 同步数据
-        updatJobs(bench.jobList, bench.jobCount);  // 更新任务 ok
-        if (bench.jobCount > 0) {  // 前置过滤 ok
-            kernel_preFilter<<<(bench.jobCount+127)/128, 128>>>
-            (data.prefix, data.baseCutoff, bench.jobList,
-            bench.jobCount, bench.representative);
-        }
-        cudaDeviceSynchronize();  // 同步数据
-        updatJobs(bench.jobList, bench.jobCount);  // 更新任务 ok
-        if (bench.jobCount > 0) {  // 标准过滤 ok
-            kernel_filter<<<bench.jobCount, 128>>>
-            (data.offsets, data.words, data.wordCounts, data.orders,
-            data.wordCutoff, bench.table, bench.jobList, bench.jobCount);
-        }
-        cudaDeviceSynchronize();  // 同步数据
-        //----比对工作----//
-        updatJobs(bench.jobList, bench.jobCount);  // 更新任务 ok
-        if (bench.jobCount > 0) {  // 动态规划 ok
-            kernel_dynamic<<<(bench.jobCount+127)/128, 128>>>(data.lengths,
-            data.offsets, data.gaps, data.compressed, data.baseCutoff,
-            bench.cluster, bench.jobList, bench.jobCount, bench.representative);
-        }
-        //----收尾工作----//
-        // 清零table oka
-        kernel_cleanTable<<<128, 128>>>(data.offsets, data.words,
-        data.wordCounts, data.orders, bench.table, bench.representative);
-        cudaDeviceSynchronize();  // 同步数据
-    }
-    std::cout << std::endl;
+	int readsCount = data.readsCount;
+	initBench(bench, readsCount); // Initialize bench ok
+	std::cout << "Representative sequence/total sequence count:" << std::endl;
+	
+	int buffer_size = option.buffer_size; 
+	
+	int *d_cluster;
+	cudaMalloc(&d_cluster, sizeof(int) * readsCount * buffer_size);
+	cudaMemset(d_cluster, 0, sizeof(int) * readsCount * buffer_size); 
+	
+	int grid_size = option.grid_size;
+	
+	unsigned short *d_tables; 
+	cudaMalloc(&d_tables, sizeof(unsigned short) * grid_size * (1 << 2 * 8)); 
+	
+	int *d_job_lists; 
+	cudaMalloc(&d_job_lists, sizeof(int) * readsCount * grid_size); 
+	
+	int *d_valid; 
+	cudaMalloc(&d_valid, sizeof(int) * readsCount); 
+	cudaMemset(d_valid, 0, sizeof(int) * readsCount);
+	
+	int iters = (int)ceil((double)readsCount / grid_size); 
+	for (int i = 0; i < iters; i++) {
+		kernel_iteration<<<grid_size,1,1>>>(data, bench, readsCount, i, grid_size, buffer_size, d_cluster, d_tables, d_job_lists);
+		kernel_set_valid_serial<<<1,1>>>(readsCount, grid_size, buffer_size, 1024, d_valid, d_cluster, i); 
+	}
+	
+	bench.cluster = (int*)malloc(sizeof(int) * readsCount); 
+	cudaMemcpy(bench.cluster, d_cluster, sizeof(int) * readsCount, cudaMemcpyDeviceToHost);
+	checkError(); 
 }
 //--------------------收尾函数--------------------//
 // saveFile 保存结果
