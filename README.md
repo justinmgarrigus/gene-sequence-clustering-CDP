@@ -16,5 +16,5 @@ Note: increasing `g` and `b` may improve performance, but it will also increase 
 ## Speed Comparison
 Program was run 10 times on the default input provided (testData.fasta) and their performance is measured: 
 ![Performance Graph](/line-graph.png)
-Non-CDP: average = 2877 ms, standard deviation = 271 ms
-CDP: average = 2179 ms, standard deviation = 113 ms 
+* Non-CDP: average = 2877 ms, standard deviation = 271 ms
+* CDP: average = 2179 ms, standard deviation = 113 ms 
