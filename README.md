@@ -18,3 +18,4 @@ Program was run 10 times on the default input provided (testData.fasta) and thei
 ![Performance Graph](/line-graph.png)
 * Non-CDP: average = 2877 ms, standard deviation = 271 ms
 * CDP: average = 2179 ms, standard deviation = 113 ms 
+  * 24.2% decrease in execution time 
